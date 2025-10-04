@@ -1,0 +1,11 @@
+//
+//  .gitignore
+//  subtitle_correct
+//
+//  Created by Leo Y on 2025/10/4.
+//
+
+// Xcode
+DerivedData
+build
+xcuserdata
