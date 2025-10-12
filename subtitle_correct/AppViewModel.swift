@@ -8,6 +8,7 @@
 import Foundation
 import Combine
 import SwiftUI
+import AVFoundation
 
 @MainActor
 final class AppViewModel: ObservableObject {
@@ -24,25 +25,37 @@ final class AppViewModel: ObservableObject {
     @Published var validationIssues: [ValidationIssue] = []
     @Published var lastReplacementCount: Int?
     @Published private(set) var typoCorrections: [TypoCorrection] = []
+    @Published var videoRootURL: URL?
+    @Published private(set) var currentVideoURL: URL?
+    @Published private(set) var videoPlayer: AVPlayer?
+    @Published private(set) var playbackRate: Float = 1.2
 
     private static let lastRootBookmarkKey = "LastSelectedRootBookmarkData"
     private static let lastRootPathKey = "LastSelectedRootPath"
+    private static let lastVideoBookmarkKey = "LastSelectedVideoBookmarkData"
+    private static let lastVideoPathKey = "LastSelectedVideoPath"
     private let userDefaults = UserDefaults.standard
     private let fileManager = FileManager.default
     private var securityScopedRootURL: URL?
+    private var securityScopedVideoRootURL: URL?
     private let typoCorrectionsURL: URL
     private var isLoadingTypoCorrections = false
+    private var videoLookupTask: Task<Void, Never>?
 
     deinit {
         securityScopedRootURL?.stopAccessingSecurityScopedResource()
+        securityScopedVideoRootURL?.stopAccessingSecurityScopedResource()
+        videoLookupTask?.cancel()
     }
 
     init(defaultRoot: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)) {
         self.rootURL = defaultRoot
         self.typoCorrectionsURL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".subtitle_correct_typos.json", isDirectory: false)
+        print(typoCorrectionsURL.path())
         loadTypoCorrections()
         configureInitialRoot(fallback: defaultRoot)
+        configureInitialVideoRoot()
         refreshTree()
     }
 
@@ -61,6 +74,16 @@ final class AppViewModel: ObservableObject {
 
         if !prepareRootAccess(for: fallback) {
             loadError = "无法访问默认目录，请选择其他文件夹。"
+        }
+    }
+
+    private func configureInitialVideoRoot() {
+        guard let restoredURL = restorePersistedVideoRootURL() else { return }
+        if prepareVideoRootAccess(for: restoredURL) {
+            videoRootURL = restoredURL
+            persistVideoRootBookmark(for: restoredURL)
+        } else {
+            clearPersistedVideoRoot()
         }
     }
 
@@ -132,12 +155,46 @@ final class AppViewModel: ObservableObject {
     func refreshTree() {
         Task { @MainActor in
             let tree = buildTree(for: rootURL)
+            let hydratedStates = loadReviewStates(for: tree)
+
             fileTree = tree
-            if let articleURL = articleDocument?.url, let node = node(for: articleURL, within: tree) {
+
+            for (url, state) in hydratedStates {
+                if let currentDocument = articleDocument,
+                   currentDocument.url == url,
+                   currentDocument.hasUnsavedChanges {
+                    continue
+                }
+                reviewStates[url] = state
+            }
+
+            if let articleURL = articleDocument?.url,
+               let node = node(for: articleURL, within: tree) {
                 selectedNodeID = node.id
-            } else if selectedNodeID == nil, let first = firstFileNode(in: tree) {
+            } else if selectedNodeID == nil,
+                      let first = firstFileNode(in: tree) {
                 selectedNodeID = first.id
             }
+        }
+    }
+
+    func deleteFileNode(_ node: FileNode) {
+        guard !node.isDirectory else { return }
+        if articleDocument?.url == node.url {
+            articleDocument = nil
+        }
+        if selectedNodeID == node.id {
+            selectedNodeID = nil
+        }
+        reviewStates.removeValue(forKey: node.url)
+        validationIssues = []
+        lastReplacementCount = nil
+
+        do {
+            try fileManager.removeItem(at: node.url)
+            refreshTree()
+        } catch {
+            loadError = "删除失败：\(error.localizedDescription)"
         }
     }
 
@@ -155,6 +212,23 @@ final class AppViewModel: ObservableObject {
         loadError = nil
         lastReplacementCount = nil
         refreshTree()
+    }
+
+    func selectVideoFolder(at url: URL) {
+        securityScopedVideoRootURL?.stopAccessingSecurityScopedResource()
+        securityScopedVideoRootURL = nil
+
+        guard prepareVideoRootAccess(for: url) else {
+            loadError = "无法访问所选视频文件夹，请检查权限。"
+            clearPersistedVideoRoot()
+            return
+        }
+
+        videoRootURL = url
+        persistVideoRootBookmark(for: url)
+        if let currentArticleURL = articleDocument?.url {
+            loadMatchingVideo(for: currentArticleURL)
+        }
     }
 
     func saveChanges() {
@@ -238,6 +312,7 @@ final class AppViewModel: ObservableObject {
     private func loadSelectedArticle() {
         guard let selectedID = selectedNodeID, let node = node(for: selectedID, within: fileTree), !node.isDirectory else {
             articleDocument = nil
+            applyVideoSelection(nil)
             return
         }
 
@@ -253,27 +328,33 @@ final class AppViewModel: ObservableObject {
             loadError = nil
             validationIssues = []
             lastReplacementCount = nil
+            loadMatchingVideo(for: node.url)
         } catch let DecodingError.keyNotFound(key, context) {
             articleDocument = nil
+            applyVideoSelection(nil)
             let path = (context.codingPath.map { $0.stringValue }).joined(separator: ".")
             loadError = "无法加载 JSON：缺少必需字段 ‘\(key.stringValue)’。路径：\(path)。"
             lastReplacementCount = nil
         } catch let DecodingError.typeMismatch(type, context) {
             articleDocument = nil
+            applyVideoSelection(nil)
             let path = (context.codingPath.map { $0.stringValue }).joined(separator: ".")
             loadError = "无法加载 JSON：字段类型不匹配（期望 \(type)）。路径：\(path)。"
             lastReplacementCount = nil
         } catch let DecodingError.valueNotFound(type, context) {
             articleDocument = nil
+            applyVideoSelection(nil)
             let path = (context.codingPath.map { $0.stringValue }).joined(separator: ".")
             loadError = "无法加载 JSON：必需值缺失（\(type)）。路径：\(path)。"
             lastReplacementCount = nil
         } catch let DecodingError.dataCorrupted(context) {
             articleDocument = nil
+            applyVideoSelection(nil)
             loadError = "无法加载 JSON：数据损坏。\(context.debugDescription)"
             lastReplacementCount = nil
         } catch {
             articleDocument = nil
+            applyVideoSelection(nil)
             loadError = "无法加载 JSON：\(error.localizedDescription)"
             lastReplacementCount = nil
         }
@@ -364,6 +445,140 @@ final class AppViewModel: ObservableObject {
     var selectedNode: FileNode? {
         guard let id = selectedNodeID else { return nil }
         return node(for: id, within: fileTree)
+    }
+
+    private func loadReviewStates(for nodes: [FileNode]) -> [URL: ReviewState] {
+        var result: [URL: ReviewState] = [:]
+        var stack = nodes
+
+        while let node = stack.popLast() {
+            if node.isDirectory {
+                stack.append(contentsOf: node.children ?? [])
+                continue
+            }
+
+            if let state = reviewState(for: node.url) {
+                result[node.url] = state
+            }
+        }
+
+        return result
+    }
+
+    private func reviewState(for url: URL) -> ReviewState? {
+        guard url.pathExtension.lowercased() == "json" else { return nil }
+
+        do {
+            let data = try Data(contentsOf: url)
+            let envelope = try JSONDecoder().decode(ReviewStateEnvelope.self, from: data)
+            if let value = envelope.reviewState,
+               let state = ReviewState(rawValue: value) {
+                return state
+            }
+        } catch {
+            return nil
+        }
+
+        return nil
+    }
+
+    private func loadMatchingVideo(for subtitleURL: URL) {
+        videoLookupTask?.cancel()
+
+        guard let videoRootURL else {
+            applyVideoSelection(nil)
+            return
+        }
+
+        let baseName = subtitleURL.deletingPathExtension().lastPathComponent
+        videoLookupTask = Task { [weak self] in
+            guard let self else { return }
+            let matchedURL = await self.lookupVideo(named: baseName, under: videoRootURL)
+            guard !Task.isCancelled else { return }
+            self.applyVideoSelection(matchedURL)
+        }
+    }
+
+    private func lookupVideo(named baseName: String, under root: URL) async -> URL? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let fm = FileManager.default
+                let targetName = baseName + ".mp4"
+                let enumerator = fm.enumerator(at: root,
+                                               includingPropertiesForKeys: [.isDirectoryKey],
+                                               options: [.skipsHiddenFiles, .skipsPackageDescendants])
+                while let next = enumerator?.nextObject() as? URL {
+                    if next.lastPathComponent.compare(targetName, options: .caseInsensitive) == .orderedSame {
+                        var isDirectory: ObjCBool = false
+                        if fm.fileExists(atPath: next.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+                            continuation.resume(returning: next)
+                            return
+                        }
+                    }
+                }
+                continuation.resume(returning: nil)
+            }
+        }
+    }
+
+    @MainActor
+    private func applyVideoSelection(_ url: URL?) {
+        if currentVideoURL == url {
+            return
+        }
+
+        currentVideoURL = url
+
+        if let url {
+            videoPlayer = AVPlayer(url: url)
+            videoPlayer?.seek(to: .zero)
+        } else {
+            videoPlayer?.pause()
+            videoPlayer = nil
+        }
+    }
+
+    func playVideo(at timestamp: String) {
+        guard let player = videoPlayer,
+              let seconds = seconds(fromTimestamp: timestamp) else { return }
+
+        let target = CMTime(seconds: seconds, preferredTimescale: 600)
+        let tolerance = CMTime(seconds: 0.2, preferredTimescale: 600)
+
+        player.seek(to: target, toleranceBefore: tolerance, toleranceAfter: tolerance) { finished in
+            guard finished else { return }
+            player.play()
+            player.rate = self.playbackRate
+        }
+    }
+
+    @discardableResult
+    func adjustPlaybackRate(by delta: Float) -> Float {
+        let raw = playbackRate + delta
+        let clamped = max(0.1, min(3.0, raw))
+        let rounded = Float((Double(clamped) * 10).rounded() / 10.0)
+        if abs(rounded - playbackRate) > 0.0001 {
+            playbackRate = rounded
+            applyCurrentPlaybackRate()
+        }
+        return playbackRate
+    }
+
+    private func applyCurrentPlaybackRate() {
+        guard let player = videoPlayer else { return }
+        player.rate = playbackRate
+    }
+
+    private func seconds(fromTimestamp timestamp: String) -> Double? {
+        guard let components = components(from: timestamp),
+              let hour = components.hour,
+              let minute = components.minute,
+              let second = components.second else {
+            return nil
+        }
+
+        let totalSeconds = Double(hour * 3600 + minute * 60 + second)
+        return totalSeconds.isFinite ? totalSeconds : nil
     }
 
     private func components(from timestamp: String) -> DateComponents? {
@@ -504,6 +719,83 @@ final class AppViewModel: ObservableObject {
         }
         return sorted
     }
+}
+
+// MARK: - Video Root Persistence
+
+private extension AppViewModel {
+    func restorePersistedVideoRootURL() -> URL? {
+        if let bookmarkData = userDefaults.data(forKey: Self.lastVideoBookmarkKey) {
+            var isStale = false
+            do {
+                let resolved = try URL(resolvingBookmarkData: bookmarkData,
+                                       options: [.withSecurityScope],
+                                       relativeTo: nil,
+                                       bookmarkDataIsStale: &isStale)
+                if fileManager.fileExists(atPath: resolved.path) {
+                    return resolved
+                } else {
+                    clearPersistedVideoRoot()
+                }
+            } catch {
+                print("[VideoRootBookmark] Failed to resolve: \(error)")
+                clearPersistedVideoRoot()
+            }
+        }
+
+        if let storedPath = userDefaults.string(forKey: Self.lastVideoPathKey) {
+            let url = URL(fileURLWithPath: storedPath, isDirectory: true)
+            if fileManager.fileExists(atPath: url.path) {
+                return url
+            } else {
+                clearPersistedVideoRoot()
+            }
+        }
+
+        return nil
+    }
+
+    @discardableResult
+    func prepareVideoRootAccess(for url: URL) -> Bool {
+        securityScopedVideoRootURL = nil
+        if url.startAccessingSecurityScopedResource() {
+            securityScopedVideoRootURL = url
+            return true
+        }
+        if fileManager.isReadableFile(atPath: url.path) {
+            return true
+        }
+        return false
+    }
+
+    func persistVideoRootBookmark(for url: URL) {
+        guard url.isFileURL else { return }
+
+        do {
+            let data = try url.bookmarkData(options: [.withSecurityScope],
+                                            includingResourceValuesForKeys: nil,
+                                            relativeTo: nil)
+            userDefaults.set(data, forKey: Self.lastVideoBookmarkKey)
+        } catch {
+            print("[VideoRootBookmark] Failed to store: \(error)")
+            userDefaults.removeObject(forKey: Self.lastVideoBookmarkKey)
+        }
+
+        userDefaults.set(url.path, forKey: Self.lastVideoPathKey)
+    }
+
+    func clearPersistedVideoRoot() {
+        userDefaults.removeObject(forKey: Self.lastVideoBookmarkKey)
+        userDefaults.removeObject(forKey: Self.lastVideoPathKey)
+        securityScopedVideoRootURL?.stopAccessingSecurityScopedResource()
+        securityScopedVideoRootURL = nil
+        videoRootURL = nil
+        applyVideoSelection(nil)
+    }
+}
+
+private struct ReviewStateEnvelope: Decodable {
+    let reviewState: String?
 }
 
 extension AppViewModel {

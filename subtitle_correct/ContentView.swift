@@ -8,10 +8,12 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import AVKit
 
 struct ContentView: View {
     @StateObject private var viewModel: AppViewModel
     @State private var isShowingFolderImporter = false
+    @State private var isShowingVideoFolderImporter = false
     @State private var isShowingRevertAlert = false
 
     init() {
@@ -28,7 +30,8 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             SidebarView(viewModel: viewModel,
-                        onSelectFolder: { isShowingFolderImporter = true })
+                        onSelectFolder: { isShowingFolderImporter = true },
+                        onSelectVideoFolder: { isShowingVideoFolderImporter = true })
         } detail: {
             DetailView(viewModel: viewModel,
                        onRequestFolderPicker: { isShowingFolderImporter = true },
@@ -55,6 +58,18 @@ struct ContentView: View {
                 viewModel.loadError = "无法打开文件夹：\(error.localizedDescription)"
             }
         }
+        .fileImporter(isPresented: $isShowingVideoFolderImporter,
+                      allowedContentTypes: [.folder],
+                      allowsMultipleSelection: false) { result in
+            switch result {
+            case .success(let urls):
+                if let url = urls.first {
+                    viewModel.selectVideoFolder(at: url)
+                }
+            case .failure(let error):
+                viewModel.loadError = "无法设置视频文件夹：\(error.localizedDescription)"
+            }
+        }
         .alert("错误", isPresented: Binding<Bool>(
             get: { viewModel.loadError != nil },
             set: { isPresented in
@@ -71,25 +86,12 @@ struct ContentView: View {
 private struct SidebarView: View {
     @ObservedObject var viewModel: AppViewModel
     var onSelectFolder: () -> Void
+    var onSelectVideoFolder: () -> Void
+    @State private var pendingDeletionNode: FileNode?
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text(viewModel.rootURL.lastPathComponent)
-                    .font(.headline)
-                    .lineLimit(1)
-                Spacer()
-                Button {
-                    onSelectFolder()
-                } label: {
-                    Label("选择文件夹", systemImage: "folder.badge.plus")
-                        .labelStyle(.iconOnly)
-                }
-                .help("切换待审文件夹")
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal)
-            .padding(.vertical, 8)
+            header
 
             Divider()
 
@@ -102,11 +104,363 @@ private struct SidebarView: View {
                                 isSelected: viewModel.selectedNode?.id == node.id,
                                 reviewState: viewModel.reviewStates[node.url] ?? .notStarted,
                                 hasUnsavedChanges: viewModel.articleDocument?.url == node.url && (viewModel.articleDocument?.hasUnsavedChanges ?? false))
+                    .contextMenu {
+                        if !node.isDirectory && node.url.pathExtension.lowercased() == "json" {
+                            Button(role: .destructive) {
+                                pendingDeletionNode = node
+                            } label: {
+                                Label("删除", systemImage: "trash")
+                            }
+                        }
+                    }
                     .tag(node.id)
                 }
             }
             .listStyle(.sidebar)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .alert(item: $pendingDeletionNode) { node in
+                let hasUnsaved = viewModel.articleDocument?.url == node.url && (viewModel.articleDocument?.hasUnsavedChanges ?? false)
+                let message = hasUnsaved ? "该文件存在未保存修改，删除后将无法恢复。" : "删除后将无法恢复此文件。"
+                return Alert(title: Text("确认删除 \"\(node.name)\"？"),
+                             message: Text(message),
+                             primaryButton: .destructive(Text("删除")) {
+                                 viewModel.deleteFileNode(node)
+                                 pendingDeletionNode = nil
+                             },
+                             secondaryButton: .cancel {
+                                 pendingDeletionNode = nil
+                             })
+            }
+
+            Divider()
+
+            SidebarVideoPlayerView(player: viewModel.videoPlayer,
+                                   videoURL: viewModel.currentVideoURL,
+                                   videoRootURL: viewModel.videoRootURL,
+                                   playbackRate: viewModel.playbackRate,
+                                   onAdjustPlaybackRate: { delta in viewModel.adjustPlaybackRate(by: delta) },
+                                   onSelectVideoFolder: onSelectVideoFolder)
+                .padding(.horizontal)
+                .padding(.vertical, 8)
         }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(viewModel.rootURL.lastPathComponent)
+                    .font(.headline)
+                    .lineLimit(1)
+                Spacer()
+                Button {
+                    viewModel.refreshTree()
+                } label: {
+                    Label("刷新", systemImage: "arrow.clockwise")
+                        .labelStyle(.iconOnly)
+                }
+                .help("重新加载当前文件夹")
+                .buttonStyle(.plain)
+
+                Button {
+                    onSelectVideoFolder()
+                } label: {
+                    Label("设置视频目录", systemImage: "film")
+                        .labelStyle(.iconOnly)
+                }
+                .help("指定匹配视频所在的文件夹")
+                .buttonStyle(.plain)
+
+                Button {
+                    onSelectFolder()
+                } label: {
+                    Label("选择文件夹", systemImage: "folder.badge.plus")
+                        .labelStyle(.iconOnly)
+                }
+                .help("切换待审文件夹")
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal)
+            .padding(.top, 8)
+
+            if let videoRoot = viewModel.videoRootURL {
+                Text("视频目录：\(videoRoot.lastPathComponent)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal)
+            } else {
+                Text("未设置视频目录")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal)
+            }
+        }
+        .padding(.bottom, 8)
+    }
+}
+
+private struct SidebarVideoPlayerView: View {
+    let player: AVPlayer?
+    let videoURL: URL?
+    let videoRootURL: URL?
+    let playbackRate: Float
+    let onAdjustPlaybackRate: (Float) -> Float
+    var onSelectVideoFolder: () -> Void
+
+    @State private var controlsBridge = PlayerControlsBridge()
+    @State private var playbackSpeedMenuAvailable = false
+    @State private var overlayText: String?
+    @State private var overlayHideTask: Task<Void, Never>?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Button {
+                    controlsBridge.showPlaybackSpeedMenu()
+                } label: {
+                    Image(systemName: "speedometer")
+                }
+                .buttonStyle(.borderless)
+                .disabled(player == nil || !playbackSpeedMenuAvailable)
+                .help("调整播放速度")
+
+                Text("视频预览")
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                Spacer()
+                if let videoURL {
+                    Text(videoURL.lastPathComponent)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
+            ZStack {
+                PlayerContainer(player: player, controller: controlsBridge)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(.quaternary)
+                    )
+                    .overlay(alignment: .topLeading) {
+                        if let overlayText {
+                            Text(overlayText)
+                                .font(.system(size: 13, weight: .semibold))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(.ultraThinMaterial, in: Capsule())
+                                .padding(12)
+                        }
+                    }
+
+                if player == nil {
+                    VStack(spacing: 6) {
+                        Image(systemName: "film")
+                            .font(.system(size: 28))
+                            .foregroundStyle(.secondary)
+                        Text(videoRootURL == nil ? "请选择视频目录" : "未找到匹配的视频")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Button {
+                            onSelectVideoFolder()
+                        } label: {
+                            Text(videoRootURL == nil ? "设置视频目录" : "重新选择视频目录")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                    .padding()
+                }
+            }
+            .frame(height: 220)
+        }
+        .onAppear {
+            controlsBridge.availabilityHandler = { available in
+                if playbackSpeedMenuAvailable != available {
+                    DispatchQueue.main.async {
+                        playbackSpeedMenuAvailable = available
+                    }
+                }
+            }
+            controlsBridge.adjustPlaybackRateHandler = { delta in
+                let updated = onAdjustPlaybackRate(delta)
+                showOverlay(for: updated)
+            }
+            controlsBridge.refreshAvailability()
+        }
+        .onDisappear {
+            controlsBridge.availabilityHandler = nil
+            controlsBridge.adjustPlaybackRateHandler = nil
+            overlayHideTask?.cancel()
+        }
+        .onChange(of: playbackRate) { newValue in
+            showOverlay(for: newValue)
+        }
+    }
+
+    private func showOverlay(for rate: Float) {
+        guard player != nil else {
+            overlayHideTask?.cancel()
+            overlayText = nil
+            return
+        }
+        let text = String(format: "%.1fx", rate)
+        overlayHideTask?.cancel()
+        overlayText = text
+        overlayHideTask = Task {
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            await MainActor.run {
+                overlayText = nil
+            }
+        }
+    }
+}
+
+private struct PlayerContainer: NSViewRepresentable {
+    let player: AVPlayer?
+    let controller: PlayerControlsBridge
+
+    func makeNSView(context: Context) -> CustomAVPlayerView {
+        let view = CustomAVPlayerView()
+        view.controlsStyle = .floating
+        view.showsFullScreenToggleButton = true
+        view.updatesNowPlayingInfoCenter = false
+        view.player = player
+        view.bridge = controller
+        controller.playerView = view
+        return view
+    }
+
+    func updateNSView(_ nsView: CustomAVPlayerView, context: Context) {
+        controller.playerView = nsView
+        if nsView.player !== player {
+            nsView.player = player
+        }
+        nsView.updatePlaybackSpeedButtonLayout()
+    }
+}
+
+private final class PlayerControlsBridge {
+    fileprivate weak var playerView: CustomAVPlayerView? {
+        didSet { refreshAvailability() }
+    }
+    fileprivate var availabilityHandler: ((Bool) -> Void)?
+    fileprivate var adjustPlaybackRateHandler: ((Float) -> Void)?
+    private var lastReportedAvailability: Bool?
+
+    func showPlaybackSpeedMenu() {
+        guard let button = playerView?.playbackSpeedButton() else { return }
+        if button.isEnabled {
+            button.performClick(nil)
+        }
+    }
+
+    fileprivate func refreshAvailability() {
+        let available = playerView?.playbackSpeedButton() != nil
+        if lastReportedAvailability == available { return }
+        lastReportedAvailability = available
+        availabilityHandler?(available)
+    }
+
+    fileprivate func requestAdjustPlaybackRate(delta: Float) {
+        adjustPlaybackRateHandler?(delta)
+    }
+}
+
+private final class CustomAVPlayerView: AVPlayerView {
+    weak var bridge: PlayerControlsBridge?
+
+    override func layout() {
+        super.layout()
+        updatePlaybackSpeedButtonLayout()
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func becomeFirstResponder() -> Bool {
+        true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard let characters = event.charactersIgnoringModifiers else {
+            super.keyDown(with: event)
+            return
+        }
+
+        var handled = false
+        for scalar in characters.unicodeScalars {
+            switch scalar {
+            case "[":
+                bridge?.requestAdjustPlaybackRate(delta: -0.1)
+                handled = true
+            case "]":
+                bridge?.requestAdjustPlaybackRate(delta: 0.1)
+                handled = true
+            default:
+                break
+            }
+        }
+
+        if !handled {
+            super.keyDown(with: event)
+        }
+    }
+
+    func updatePlaybackSpeedButtonLayout() {
+        defer { bridge?.refreshAvailability() }
+        guard let button = playbackSpeedButton(),
+              let stack = button.superview as? NSStackView else { return }
+        if let index = stack.arrangedSubviews.firstIndex(of: button), index != 0 {
+            stack.removeArrangedSubview(button)
+            stack.insertArrangedSubview(button, at: 0)
+        }
+    }
+
+    fileprivate func playbackSpeedButton() -> NSButton? {
+        return findPlaybackSpeedButton(in: self)
+    }
+
+    private func findPlaybackSpeedButton(in root: NSView) -> NSButton? {
+        for subview in root.subviews {
+            if let button = subview as? NSButton, isPlaybackSpeedButton(button) {
+                return button
+            }
+            if let match = findPlaybackSpeedButton(in: subview) {
+                return match
+            }
+        }
+        return nil
+    }
+
+    private func isPlaybackSpeedButton(_ button: NSButton) -> Bool {
+        let typeName = String(describing: type(of: button)).lowercased()
+        if typeName.contains("playback") && typeName.contains("speed") {
+            return true
+        }
+
+        if let identifier = button.identifier?.rawValue.lowercased(),
+           identifier.contains("playback") && identifier.contains("speed") {
+            return true
+        }
+
+        if let accessibilityLabel = button.accessibilityLabel()?.lowercased(),
+           accessibilityLabel.contains("playback") && accessibilityLabel.contains("speed") {
+            return true
+        }
+
+        if let menu = button.menu {
+            let titles = menu.items.map { $0.title.lowercased() }
+            if titles.contains(where: { $0.contains("playback") && $0.contains("speed") }) {
+                return true
+            }
+        }
+
+        return false
     }
 }
 
@@ -252,19 +606,35 @@ private struct ArticleEditorView: View {
             }
             .disabled(!(viewModel.articleDocument?.hasUnsavedChanges ?? false))
         }
-
-        ToolbarItem(placement: .principal) {
-            HStack {
-                Image(systemName: "doc.text")
-                Text(document.url.lastPathComponent)
-                    .font(.headline)
-            }
-        }
-
+        
         ToolbarItem(placement: .status) {
             SearchField(text: $viewModel.searchText)
                 .frame(width: 220)
         }
+        
+        ToolbarItem(placement: .principal) {
+            HStack {
+//                Image(systemName: "doc.text")
+//                Text(document.url.lastPathComponent)
+//                    .font(.headline)
+                Button {
+                    viewModel.replaceTyposInContent()
+                } label: {
+                    Label("替换", systemImage: "wand.and.stars")
+                        .labelStyle(.titleAndIcon)
+                }
+                .disabled(viewModel.articleDocument == nil)
+
+                Button {
+                    isShowingCorrectionsSheet = true
+                } label: {
+                    Label("词库", systemImage: "square.3.layers.3d.bottom.filled")
+                        .labelStyle(.titleAndIcon)
+                }
+            }
+        }
+
+        
     }
 
     private var header: some View {
@@ -444,20 +814,7 @@ private struct ArticleEditorView: View {
                 Stepper("字体: \(Int(viewModel.contentFontSize))", value: $viewModel.contentFontSize, in: 10.0...30.0)
                     .frame(width: 160)
 
-                Button {
-                    viewModel.replaceTyposInContent()
-                } label: {
-                    Label("替换错别字", systemImage: "wand.and.stars")
-                        .labelStyle(.titleAndIcon)
-                }
-                .disabled(viewModel.articleDocument == nil)
-
-                Button {
-                    isShowingCorrectionsSheet = true
-                } label: {
-                    Label("管理替换词", systemImage: "slider.horizontal.3")
-                        .labelStyle(.titleAndIcon)
-                }
+                
 
                 Spacer()
 
@@ -503,6 +860,7 @@ private struct ArticleEditorView: View {
         let isMissing = entry.text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let characterCount = entry.text.wrappedValue.count
         let isImportant = entry.important.wrappedValue ?? false
+        let canPreviewInPlayer = viewModel.videoPlayer != nil && seconds(from: entry.timestample.wrappedValue) != nil
 
         return HStack(alignment: .top, spacing: 12) {
             // 左列：正文（主视区）
@@ -513,7 +871,7 @@ private struct ArticleEditorView: View {
                         .frame(minHeight: 100)
                         .scrollContentBackground(.hidden)
                         .padding(.horizontal, 4)
-                        .padding(.vertical, 6)
+                        .padding(.vertical, 4)
                     if entry.text.wrappedValue.isEmpty {
                         Text("请输入字幕文本")
                             .foregroundStyle(.secondary)
@@ -559,14 +917,22 @@ private struct ArticleEditorView: View {
                 .foregroundStyle(isImportant ? Color.yellow : Color.primary)
 
                 HStack(spacing: 8) {
-                    Button { move(entry: entry.wrappedValue, up: true) } label: { Image(systemName: "arrow.up") }
-                        .buttonStyle(.borderless)
-                        .disabled(isFirst(entry: entry.wrappedValue))
-                    Button { move(entry: entry.wrappedValue, up: false) } label: { Image(systemName: "arrow.down") }
-                        .buttonStyle(.borderless)
-                        .disabled(isLast(entry: entry.wrappedValue))
-                    Button(role: .destructive) { document.removeContentEntry(entry.wrappedValue) } label: { Image(systemName: "trash") }
-                        .buttonStyle(.borderless)
+                    Button {
+                        viewModel.playVideo(at: entry.timestample.wrappedValue)
+                    } label: {
+                        Image(systemName: "play.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!canPreviewInPlayer)
+                    .help(canPreviewInPlayer ? "在视频预览中播放当前时间点" : "请先指定视频目录并确认时间格式")
+                    Button {
+                        openPlayback(for: entry.wrappedValue)
+                    } label: {
+                        Image(systemName: "play.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(playbackURL(for: entry.wrappedValue) == nil)
+                    .help("在浏览器中定位播放")
                     Button { copyToPasteboard(entry.text.wrappedValue) } label: { Image(systemName: "doc.on.doc") }
                         .buttonStyle(.borderless)
                         .help("复制字幕文本到剪贴板")
@@ -581,30 +947,6 @@ private struct ArticleEditorView: View {
         .animation(.easeInOut(duration: 0.12), value: highlight)
         .animation(.easeInOut(duration: 0.12), value: dimmed)
         .animation(.easeInOut(duration: 0.12), value: isImportant)
-    }
-
-    private func isFirst(entry: ArticleContent) -> Bool {
-        guard let first = document.article.content.first else { return false }
-        return first.id == entry.id
-    }
-
-    private func isLast(entry: ArticleContent) -> Bool {
-        guard let last = document.article.content.last else { return false }
-        return last.id == entry.id
-    }
-
-    private func move(entry: ArticleContent, up: Bool) {
-        guard let index = document.article.content.firstIndex(where: { $0.id == entry.id }) else { return }
-        if up {
-            guard index > 0 else { return }
-            let item = document.article.content.remove(at: index)
-            document.article.content.insert(item, at: index - 1)
-        } else {
-            guard index < document.article.content.count - 1 else { return }
-            let item = document.article.content.remove(at: index)
-            let target = min(index + 1, document.article.content.count)
-            document.article.content.insert(item, at: target)
-        }
     }
 
     private var searchKeyword: String? {
@@ -642,6 +984,32 @@ private struct ArticleEditorView: View {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
+    }
+
+    private func openPlayback(for entry: ArticleContent) {
+        guard let url = playbackURL(for: entry) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func playbackURL(for entry: ArticleContent) -> URL? {
+        guard let base = viewModel.articleDocument?.article.url,
+              !base.isEmpty,
+              let seconds = seconds(from: entry.timestample),
+              var components = URLComponents(string: base) else { return nil }
+
+        var items = components.queryItems?.filter { $0.name.lowercased() != "t" } ?? []
+        items.append(URLQueryItem(name: "t", value: String(seconds)))
+        components.queryItems = items
+        return components.url
+    }
+
+    private func seconds(from timestamp: String) -> Int? {
+        let parts = timestamp.split(separator: ":")
+        guard parts.count == 3,
+              let hours = Int(parts[0]),
+              let minutes = Int(parts[1]),
+              let seconds = Int(parts[2]) else { return nil }
+        return hours * 3600 + minutes * 60 + seconds
     }
 
     private var validationSection: some View {
@@ -747,14 +1115,21 @@ private struct TypoCorrectionManagerView: View {
                             Text("暂无自定义替换词")
                                 .foregroundStyle(.secondary)
                         } else {
-                            ForEach($workingCorrections) { $item in
+                            ForEach(Array(workingCorrections.enumerated()), id: \.element.id) { index, correction in
                                 HStack(spacing: 12) {
-                                    TextField("原词", text: $item.source)
+                                    TextField("原词", text: binding(for: \.source, index: index))
                                         .textFieldStyle(.roundedBorder)
                                     Image(systemName: "arrow.right")
                                         .foregroundStyle(.secondary)
-                                    TextField("替换为", text: $item.replacement)
+                                    TextField("替换为", text: binding(for: \.replacement, index: index))
                                         .textFieldStyle(.roundedBorder)
+                                    Button(role: .destructive) {
+                                        removeCorrection(id: correction.id)
+                                    } label: {
+                                        Image(systemName: "trash")
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .help("删除该替换词")
                                 }
                             }
                             .onDelete { offsets in
@@ -836,6 +1211,19 @@ private struct TypoCorrectionManagerView: View {
         newReplacement = ""
     }
 
+    private func binding(for keyPath: WritableKeyPath<TypoCorrection, String>, index: Int) -> Binding<String> {
+        Binding<String>(
+            get: { workingCorrections[index][keyPath: keyPath] },
+            set: { workingCorrections[index][keyPath: keyPath] = $0 }
+        )
+    }
+
+    private func removeCorrection(id: UUID) {
+        guard let index = workingCorrections.firstIndex(where: { $0.id == id }) else { return }
+        let removed = workingCorrections.remove(at: index)
+        feedbackMessage = "已删除 \"\(removed.source)\" 的替换词"
+    }
+
     private func saveAndDismiss() {
         viewModel.updateTypoCorrections(with: sanitizedWorkingCorrections)
         dismiss()
@@ -874,4 +1262,8 @@ private struct SearchField: NSViewRepresentable {
             text.wrappedValue = field.stringValue
         }
     }
+}
+#Preview {
+    ContentView()
+        
 }
